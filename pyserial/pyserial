@@ -1,0 +1,693 @@
+#!/usr/bin/python
+
+import serial
+import scipy as scp
+import time
+import datetime
+import cPickle as pickle
+import glob
+import os
+import zmq
+import sys
+import mysql.connector
+from mysql.connector import (connection)
+from mysql.connector import errors
+import numpy as np
+
+import subprocess
+
+
+#mysql connection info
+cnx = connection.MySQLConnection()
+cursor = None
+TABLE_COLUMNS = ['DATE','SENSOR_ONE','SENSOR_TWO','SENSOR_THREE','SENSOR_FOUR','SENSOR_FIVE','SENSOR_SIX','SENSOR_SEVEN','TH_SET_TEMP','TH_VAL_TEMP','TH_HEATER_ON','AIR_HEATER_ON']
+
+logFileName = ''
+tempData = []
+trendAverage = []
+timeAverage = []
+firstCycle = True
+zeroSaveTime = time.time()
+zeroSetTemp = 0
+setTemperatures = ['20','25','30','35','40','45','50','55','60','65','70','75','80']
+indexSetTemp = 0
+#hot airparamenters
+usbStatus=False #running or not 
+airSet = False #enabled heat control
+airSetTemp=15
+lastCommand = ''
+
+#theBox
+maxTemp=60
+#LEDs
+usbSwitchLED = False
+usbZero = time.time()
+tc200LED= False
+heartBeatLED = False
+newIncommingCommand = False
+
+avTemp = 0
+prevAverageTemp = 0
+
+#databaseInfo=[None] * 11
+
+#serial settings
+serialPort = serial.Serial()
+serialPorts = ["/dev/ttyACM0","/dev/ttyACM1","/dev/ttyACM2","/dev/ttyACM3"]
+baudRate=57600
+
+#TC200 SerialPort settings
+tc200Serial = serial.Serial()
+tc200Port="/dev/ttyUSB0"
+tc200Baud=115200
+#TC200 in the context of thebox
+tc200Status = False
+tc200Connected = False
+
+
+##ZMQ definitions
+inPort = "5556"
+outPort = "5553"
+context = zmq.Context()
+socket = context.socket(zmq.PUB)
+socket.bind("tcp://*:%s"%outPort)
+#locahost ip 10.42.0.91
+theboxcs = "tcp://localhost:%s"%inPort
+im = context.socket(zmq.SUB)
+im.connect(theboxcs)
+im.setsockopt(zmq.SUBSCRIBE,'CMD')
+#im.setsockopt(zmq.RCVTIMEO,0)
+
+
+def sendReply(message,mtype=None):
+  if mtype == 'LED':
+    output = "LED:%s"%message
+  else:
+    output = "REP:%s"%message
+  debug(output)
+  socket.send(output)
+
+def sHelp():
+  helpText = "\n\nList of commands:\n\t?\t\t\t\t: Shows TheBox's Status\n\tset\ttemp\t<value>\t\t: set Temperature to <value>\n\tset\ttemp\tenable\t\t: Enable temperature control\n\tset\ttemp\tdisable\t\t: Disable Temperature Control\n\tset\tmax\t temp\t<value>\t: Set Maximum temperature\n\th\t\t\t\t: Print this message"
+  sendReply(helpText)
+ 
+def commander(): 
+  global airSetTemp
+  global airSet
+  global maxTemp
+  global newIncommingCommand
+  global lastCommand
+  isMessage = im.poll(timeout=300)
+  if isMessage  != 0:
+    message = im.recv() 
+    debug("Received request: %s"%message)
+    if 'CMD:' in message:
+      newIncommingCommand = True
+      message = message.strip('CMD:')
+      lastCommand = message
+      amessage=message.split()
+      debug("received a command")
+      if '?' in message:
+	try:
+	  pys = subprocess.check_output("ps -fea | pgrep -u thebox pyserial",stderr=subprocess.STDOUT, shell=True)
+	  statusString = "status: %s %s %s %s %s %s %s %s %s"%(pys,airSet,avTemp,airSetTemp,maxTemp,usbSwitchLED,heartBeatLED,bool(tc200Status),tc200Connected)
+	  debug(statusString)
+	  sendReply(statusString)
+	except subprocess.CalledProcessError:
+	  sendReply("TheBox")
+      if message == 'h':
+	sHelp()
+      if 'set' in message:
+	if 'temp' in message and len(amessage) == 3:
+	  if amessage[2] == 'enable':
+	    if airSet == False:
+	      airSet = True
+	      sendReply('Temperature Control Enabled')
+	    else:
+	      sendReply('Temperature Control Already Enabled')
+	  elif amessage[2] == 'disable':
+	    if airSet == True:
+	      airSet = False
+	      sendReply('Temperature Control Disabled')
+	    else:
+	      sendReply('Temperature Control Already Disabled')
+	  elif int(amessage[2]):
+	    airSetTemp=int(amessage[2])
+	    sendReply("Temperature set to %s"%airSetTemp)
+	elif 'max' in message  and 'temp' in message and len(amessage) == 4:
+	  maxTemp = int(amessage[3])
+	  sendReply("Maximum Temperature Set To: %s"%maxTemp)
+      else:
+	return
+
+    else:
+	sendReply("UNKNOWN COMMAND! %s"%message)
+ 
+def getTrend(lastAvTemp):
+  global trendAverage
+  global timeAverage
+  trendAverageLength = 10
+  trendAverage.append(lastAvTemp)
+  timeAverage.append(time.time())
+  if len(trendAverage) > trendAverageLength:
+    trendAverage = trendAverage[len(trendAverage)-trendAverageLength:]
+    timeAverage = timeAverage[len(trendAverage)-trendAverageLength:]
+    if len(trendAverage) == len(timeAverage):
+      trend = (trendAverage[-1]-trendAverage[0])/(timeAverage[-1]-timeAverage[0])
+      out = [trend,trendAverage,timeAverage]
+    else:
+      debug("Average and Time length does not match")
+  else:
+    out = [None,None,None]
+  return out
+
+
+def initTheBox():
+	global usbStatus
+	global airSet
+	global airSetTemp
+	global maxTemp
+	global usbSwitchLED
+	global tc200LED
+	global heartBeatLED
+	#global 
+	#global 
+	#global 
+	#global 
+	if '--enable-temp-control' in sys.argv:
+	  airSet = True #enabled heat control
+	  usbStatus=False #running or not
+	  
+	if '--set-overall-temp' in sys.argv and len(sys.argv) >= sys.argv.index('--set-overall-temp')+1:
+	  tempSet = False
+	  while tempSet != True:
+	    index = sys.argv.index('--set-overall-temp')
+	    if int(sys.argv[index+1]) and int(sys.argv[index+1]) <= maxTemp:
+	      airSetTemp = int(sys.argv[index+1])
+	      tempSet = True
+	    else:
+	      setTemp_raw = raw_input("Invalid temperature Value please enter new one: ")
+	      if int(setTemp_raw) and int(setTemp_raw) <= maxTemp:
+		airSetTemp = int(setTemp_raw)
+		tempSet = True
+	      elif setTemp_raw == '':
+		tempSet = True
+		    
+	#LEDs
+	usbSwitchLED = False
+	tc200LED= False
+	heartBeatLED = False
+	
+def publishMessage(message,kind='Message'):
+	if kind == 'Message':
+	  log(message)
+	if '-v' in sys.argv or '--debug' in sys.argv:
+	  debug(message)
+	if '--zmq-broadcast' in sys.argv:
+	  socket.send(message)
+
+def saveToFile(kind=None):
+	rightNow = time.strftime("%Y%m%d")
+	global logFileName
+	global tempData
+	global zeroSaveTime
+	global firstCycle
+	try:
+		logFileName = time.strftime("%Y%m%d") + "_temp_data.pkl"
+		if glob.glob(logFileName) != []:
+			publishMessage("Saving to existing logfile: %s"%logFileName)
+			if firstCycle == True:
+				#load existing file and save to the same
+				firstCycle = False
+			if kind == 'timeThreshold':
+				publishMessage("Renaming %s to %s"%(logFileName, logFileName+".OLD"))
+				old = glob.glob('*.OLD')
+				if  old != []:
+					for e in old:
+						#delete old .OLD file in order to keep only one backup
+						os.remove(e)
+				os.rename(logFileName, logFileName+".OLD")
+		else:
+			publishMessage("New log file to %s"%logFileName)
+			firstCycle = False #may need to fix this
+		f = open(logFileName,'wb')
+        	pickle.dump(tempData,f,protocol=pickle.HIGHEST_PROTOCOL)
+       		f.close()
+        	zeroSaveTime = time.time()
+	except IOError as e:
+		publishMessage("Unknown error while writting to logfile. %s"%e)
+		
+def connectToMySQL():
+	global cnx
+	global cursor
+	try:
+		cnx = connection.MySQLConnection(user='thebox', password='gasC31lbox',host='localhost' ,database='theBoxData')
+		#cnx = connection.MySQLConnection(user='thebox', password='',host='127.0.0.1',database='temperature')
+		cursor = cnx.cursor()
+	except mysql.connector.Error as err:
+		if err.errno == errorcode.ER_ACCESS_DENIED_ERROR:
+			publishMessage("MySQL: Something is wrong with your user name or password")
+		elif err.errno == errorcode.ER_BAD_DB_ERROR:
+			publishMessage("MySQL: Database does not exist")
+		else:
+			publishMessage("MySQL: %s"%err)
+	#else:
+	#	cnx.close()
+	except mysql.connector.errors.OperationalError:
+	  publishMessage("MySQL: raised OperationalError")
+	  
+		
+def writeToDatabase(newInfo):
+	global cnx
+	global cursor
+	global heartBeatLED
+	columns='( '
+	values='( '
+	for e in range(len(TABLE_COLUMNS)):
+		if e == 0:
+			columns += TABLE_COLUMNS[e]
+			values += '\'%s\''%newInfo[e]
+		else:
+			columns += TABLE_COLUMNS[e]
+			values += '\'%s\''%newInfo[e]
+		if e < len(TABLE_COLUMNS)-1:
+			columns += ' , '
+			values += ' , '
+		else:
+			columns += ' )'
+			values += ' )'
+	try:
+	  query = ("""INSERT INTO temperatureAndStatusPhaseTwo %s VALUES %s"""%(columns,values))
+	  #debug(query)
+	  #cursor.execute("INSERT INTO temperatureAndStatus %s VALUES %s",(columns,values))
+	  cursor.execute(query)
+	  cnx.commit()
+	  heartBeatLED = True
+	except mysql.connector.errors.InterfaceError:
+	  publishMessage("MySQL: raised InterfaceError")
+	  heartBeatLED = False
+	except mysql.connector.errors.OperationalError:
+	  publishMessage("MySQL: raised OperationalError")
+	  heartBeatLED = False
+	  time.sleep(30)
+	  connectToMySQL()
+	
+	return True
+		
+def serialConnect():
+	global serialPort
+	global tc200Serial
+	global tc200Connected
+	#find the right serial port
+	while True:
+		port = serialPorts[0]
+		try:
+			publishMessage("Arduino: Trying to use port %s"%port)
+			serialPort = serial.Serial(port,baudRate,timeout=0.5)
+			if serialPort.isOpen():
+				publishMessage("Arduino: Connected to %s and port is open"%port)
+			else:
+				publishMessage("Arduino: Port %s is not open"%port)
+		except serial.serialutil.SerialException:
+			publishMessage("Arduino: Error finding serial port %s"%port)
+		except KeyboardInterrupt:
+			publishMessage("Arduino: Impossible to find serial Port")
+			return False
+		time.sleep(10)
+		#this is for the TC200 from Thorlabs
+		try:
+			publishMessage("TC200: Attempting to establish TC200 Serial Connection at %s"%tc200Port)
+			tc200Serial = serial.Serial(tc200Port,tc200Baud,timeout=0.5)
+			if tc200Serial.isOpen():
+				publishMessage("TC200: Serial Connection Established with TC200 at %s"%tc200Port)
+				tc200Connected = True
+				return
+				
+			else:
+				publishMessage("TC200: Port %s is not open"%tc200Port)
+				return
+		
+		except serial.serialutil.SerialException:
+				publishMessage("TC200: Error finding serial port %s"%tc200Port)
+		return	
+
+def loop():
+	global tempData
+	global zeroSaveTime
+	global zeroSetTemp
+	global cnx
+	global cursor
+	global avTemp
+	global tc200Status
+	
+	#setLEDs('startup')
+	serialConnect()
+	connectToMySQL()
+	
+	#determine or set the last time when temperature was setNewTemp
+	if True:
+	  if '--tauto' in sys.argv:
+	    try:
+	      #query = ("""INSERT INTO thermalControl ('TSET_TIME', 'TSET_VALUE' , 'LAST_HEATER_STATUS') VALUES %s"""%values)
+	      query= ("""SELECT * FROM thermalControl ORDER BY TSET_TIME DESC LIMIT 1""")
+	      #debug(query)
+	      #cursor.execute("INSERT INTO temperatureAndStatus %s VALUES %s",(columns,values))
+	      cursor.execute(query)
+	      qOutput = cursor.fetchall()
+	      if qOutput != []:
+		#debug(qOutput)
+		cnx.commit()
+		zeroSetTemp = time.mktime(qOutput[0][0].timetuple())
+		currentTemp = int(qOutput[0][1])
+		#tc200Status = 
+		setNewTemp(currentTemp)
+	    except mysql.connector.errors.InterfaceError:
+	      publishMessage("MySQL: raised InterfaceError")
+	    except mysql.connector.errors.OperationalError:
+	      publishMessage("MySQL: raised OperationalError")
+	      time.sleep(30)
+	      connectToMySQL()
+
+	  
+	  
+	
+	
+	while True:
+		try:
+			commander()
+		except ValueError:
+			sendReply("Value Error")
+		boxController()
+		#debug(zeroSetTemp,type(zeroSetTemp))
+		#pnow = time.time()
+		#debug(pnow, type(pnow))
+		#diff = pnow - zeroSetTemp
+		#debug( diff,type(diff))
+		#debug("zeroSetTemp: %s Now: %s Diff: "%(zeroSetTemp,pnow,diff))
+		databaseInfo=[None] * 12
+		dataOut = ''
+		dataIn = serialPort.readlines(None)
+		if tc200Connected == True:
+			tc200Serial.write('temps?\r')
+			tc200Data = tc200Serial.readline(None)
+			tc200Data = tc200Data.split()
+			debug(tc200Data)
+			#databaseInfo[8]=tc200Data[3]
+			databaseInfo[8]=airSetTemp
+			databaseInfo[9]=tc200Data[7]
+			#request status byte
+			tc200Serial.write('stat?\r')
+			tc200StatusByte=tc200Serial.readline(None)
+			tc200StatusByte = tc200StatusByte.split()
+			tc200Status = int(tc200StatusByte[1])-14
+			databaseInfo[10]=tc200Status
+			
+		#dataIn = ['h j k l']
+		#publishMessage("Output Message")
+		if len(dataIn) == 1:
+			dataIn = dataIn[0].strip()
+			dataIn = dataIn.split()
+			#debug(dataIn)
+			timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+			databaseInfo[0]=timestamp
+			dataOut = timestamp + ' '
+			tempToAv = []
+			for i in range(len(dataIn)):
+				dataOut += dataIn[i][3:] + ' '
+				databaseInfo[i+1]=dataIn[i][3:]
+				if float(dataIn[i][3:]) > -10 and i < 6:
+				  #debug("LOOP: ADDTEMP:%s %s"%(i,float(dataIn[i][3:])))
+				  tempToAv.append(float(dataIn[i][3:]))
+				else:
+				  debug("LOOPP: %s %s"%(i,dataIn[i][3:]))
+			avTemp = scp.mean(tempToAv)
+			#debug("Average Temperature: %s"%avTemp)
+			#debug("Standard Deviation: %s"%scp.std(tempToAv))
+			#debug("Variance: %s"%scp.var(tempToAv))
+			if tc200Connected == True and str(tc200Data[3]) != 'Tset':
+				dataOut = dataOut + str(tc200Data[3]) + ' ' + str(tc200Data[7]) + ' ' + str(tc200Status)
+			#tempData.append(dataOut)
+			publishMessage(str(dataOut),'dataOut')
+			databaseInfo[11]=int(usbStatus)
+			writeToDatabase(databaseInfo)
+			#debug(databaseInfo)
+			#debug(dataOut)
+		else:
+		  debug("Length dataIn: %s"%len(dataIn))
+		  debug(dataIn)
+		  
+		
+		#debug(time.time() - zeroSetTemp)
+		if time.time()-zeroSetTemp >= 7200 and '--tauto' in sys.argv:
+			#debug( tc200Data[3],type(tc200Data[3]))
+			try:
+			  
+			  setNewTemp(str(int(float(tc200Data[3]))),tc200Status)
+			except ValueError:
+			  publishMessage("Error Converting %s to integer and then to string"%tc200Data[3])
+		
+		if tc200Status and (tc200Status) == 0:
+		  publishMessage("TC200 is disabled, by default it must be enabled.")
+		  tc200Serial.write('ens\r')
+		  tc200Reply=tc200Serial.readline(None)
+		  
+		#add a function for the change of day and make it save the file and change the filename
+		
+		time.sleep(0.3)
+		
+		
+		
+def setNewTemp(current,status=NotImplemented):
+    global tc200Serial
+    global indexSetTemp
+    global cnx
+    global cursor
+    global zeroSetTemp
+    
+    
+    if '--tauto' in sys.argv:
+      try:
+	  indexSetTemp = setTemperatures.index(str(current))
+	  if status != NotImplemented: 
+	    indexSetTemp += 1
+          if indexSetTemp == len(setTemperatures):
+             indexSetTemp = 0
+          if status == 0:
+	    publishMessage("TC200 is disabled, enabling now")
+	    tc200Serial.write('ens\r')
+	    tc200Reply=tc200Serial.readline(None)
+	  nTemp = setTemperatures[indexSetTemp]
+	  zeroSetTemp = time.time()
+	  timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+	  publishMessage("Change to new Set Temperature = %s"%nTemp)
+          tc200Serial.write('tset=%s\r'%nTemp) #corregir el comando
+          tc200Reply=tc200Serial.readline(None)
+          if status != NotImplemented:
+            try:
+	        query = ("""INSERT INTO thermalControl (TSET_TIME, TSET_VALUE , LAST_HEATER_STATUS) VALUES (\'%s\',\'%s\',\'%s\')"""%(timestamp,nTemp,status))
+	        #debug(query)
+	        #query= ("""SELECT * FROM thermalControl ORDER BY TSET_TIME DESC LIMIT 1""")
+	        #debug(query)
+	        #cursor.execute("INSERT INTO temperatureAndStatus %s VALUES %s",(columns,values))
+	        cursor.execute(query)
+	        #qOutput = cursor.fetchall()
+	        cnx.commit()
+	        #zeroSetTemp = time.mktime(qOutput[0][0].timetuple())
+	        #currentTemp = int(qOutput[0][1])
+	        #tc200Status = 
+	        #setNewTemp(currentTemp)
+	      
+	    except mysql.connector.errors.InterfaceError as err:
+	        publishMessage("MySQL: raised InterfaceError: %s"%err)
+	        publishMessage(err)
+	    except mysql.connector.errors.OperationalError as oErr:
+	        publishMessage("MySQL: raised OperationalError: %s"%oErr)
+	        time.sleep(30)
+	        connectToMySQL()
+          return True
+      except KeyboardInterrupt:
+	  debug('KeyboardInterrupt')
+    else:
+      publishMessage("Temperature in Manual Mode")
+    return
+    #check for serial exceptions
+		
+
+def usbSwitch(status):
+  global usbStatus
+  global usbSwitchLED
+  global usbZero
+  if status == True or status == False and airSet == True:
+    if usbStatus != status:
+      os.system('USBswitch %s'%int(status))
+      usbStatus = status
+      usbSwitchLED = status
+      publishMessage('Switching USB to %s'%status)
+      usbZero = time.time()
+    else:
+      debug("USBSWITCH: Status already %s"%status)
+      debug("USBSWITCH: STATUS: %s"%usbStatus)
+      debug("USBSWITCH: TIMEDIFF: %s"%(time.time() - usbZero))
+    
+    return
+  else:
+    publishMessage('Incorrect argument %s'%status)
+    return
+
+def log(message):
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    os.system("echo \'%s:pyserial: %s\' >> /home/thebox/theBoxLogfile.txt"%(now,message))
+    #os.system("echo \'%s:pyserial: %s\' >> /home/vultur/theBoxLogfile.txt"%(now,message))
+
+
+def debug(message):
+  if '-v' in sys.argv or '--debug' in sys.argv:
+    print("DEBUG: %s"%message)
+    
+    
+def boxController(command=None):
+  #serial ports
+  global tc200Serial
+  global serialPort
+  #statuses
+  global usbStatus
+  global airSet
+  global airSetTemp
+  global maxTemp
+  global usbSwitchLED
+  global tc200LED
+  global heartBeatLED
+  global tc200Status
+  global avTemp
+  global usbZero
+  global newIncommingCommand
+  global prevAverageTemp
+  global lastCommand
+  #debug("BOXCONTROLLER: AIRSET: %s"%airSet)
+  debug("BOXCONTROLLER::: USBSTATUS: %s"%usbStatus)
+  if avTemp != 0:
+    trend = getTrend(avTemp)
+    debug('TREND: %s TIME TO TARGET TEMP: %s'%(trend[0],airSetTemp/trend[0]))
+    if trend[0] != None:
+      if trend[0] > 0:
+	debug('Trend is Positive')
+      elif trend[0] < 0:
+	debug('Trend is Negative')
+      else:
+	debug('Trend is Stable')
+    else:
+      trend[0] = 0
+  else:
+     trend[0] = 0
+  prevAverageTemp = avTemp
+  tc200LED = tc200Status
+  debug("usbSwitchLED: %s usbStatus: %s"%(usbSwitchLED,usbStatus))
+  #heartBeatLED = True
+  LEDStatus = "%s %s %s"%(usbSwitchLED,tc200LED,heartBeatLED)
+  sendReply(LEDStatus,'LED')
+  #routineChecks
+  if newIncommingCommand == True:
+    try:
+      if 'set' and 'temp' in lastCommand:
+	if airSetTemp <= maxTemp:
+	  tc200Serial.write('tset=%s\r'%airSetTemp)
+	  tc200Reply=tc200Serial.readline(None)
+	  publishMessage(tc200Reply)
+	elif airSetTemp > maxTemp:
+	  sendReply("New temperature is higher than Maximum")
+	else:
+	  sendReply("Can't understand new temperature")
+      elif tc200Status == False and 'set' and 'temp' and 'enable' in lastCommand:
+	tc200Serial.write('ens\r')
+	tc200Reply=tc200Serial.readline(None)
+	publishMessage(tc200Reply)
+      elif tc200Status == True and 'set' and 'temp' and 'disable' in lastCommand:
+	tc200Serial.write('ens\r')
+	tc200Reply=tc200Serial.readline(None)
+	publishMessage(tc200Reply)
+    except KeyboardInterrupt:
+      debug('KeyboardInterrupt')
+  if airSet == True:
+    #debug("BOXCONTROLLER: TC200STATUS: %s"%tc200Status
+    #temperature  checks
+    
+    tempDiff = airSetTemp - avTemp
+    timeDiff = time.time() - usbZero
+    #debug("BOXCONTROLLER: TEMPDIFF: %s"%tempDiff)
+    if tempDiff > 0.05 and usbStatus == False:
+      if timeDiff > 5:
+	#debug("BOXCONTROLLER: TIMEDIFF: %s TEMPDIFF: %s"%(timeDiff,tempDiff))
+	usbSwitch(True)
+    if tempDiff < -0.05 and usbStatus == True:
+      if timeDiff  > 5:
+	#debug("BOXCONTROLLER: TIMEDIFF: %s TEMPDIFF: %s"%(timeDiff,tempDiff))
+	usbSwitch(False)
+    else:
+      #debug("BOXCONTROLLER: TIMEDIFF: %s TEMPDIFF: %s"%(timeDiff,tempDiff))
+      debug("Nothing to do")
+      #usbSwitch(False)
+  elif airSet == False:
+    try:
+      if tc200Status == True:
+	tc200Serial.write('ens\r')
+	tc200Reply=tc200Serial.readline(None)
+      if usbStatus == True:
+	usbSwitch(False)
+      if trend[0] > 0:
+	usbSwitch(False)
+    except KeyboardInterrupt:
+	  debug('KeyboardInterrupt')
+  # setLEDs()
+
+
+def turnoffKI():
+  publishMessage("")
+  publishMessage("Keyboard Interrupt... Leaving the program.")
+  publishMessage("Saving data to logfile %s"%logFileName)
+  if tc200Status == True:
+	tc200Serial.write('ens\r')
+	tc200Reply=tc200Serial.readline(None)
+	publishMessage(tc200Reply)
+  usbSwitch(False)
+  sendReply("False False False",'LED')
+  cnx.close()
+  #saveToFile()
+ 
+#########################################################################################################
+###              TO DO
+###  -Allow to continue writting in the same daily datalog file, for this it must load the same day's
+###   data and then append the new data to it
+###   - don't use first data or ignore the first line DONE
+###   - average over 10 measurements
+###   - save controlled from outside or inside (signal controller)
+###   - handle the absense/lost of TC200's serial port
+
+
+if __name__ == '__main__':
+	
+	if '-h' in sys.argv or '--help' in sys.argv or len(sys.argv) == 1:
+	  print("help")
+	  print("\t--enable-temp-control\t:")
+          print("\t--set-overall-temp <value>\t:")
+	  print("\t--debug or -v \t\t:")
+	  print("\t--zmq-broadcast\t\t:")
+	  print("\t--tauto\t\t\t: ")
+	  print("\t--help or -h \t\t:")
+	  
+	  if len(sys.argv) > 1:
+	    time.sleep(5)
+	    sys.exit(0)
+	#time.sleep(5)
+	try:
+		initTheBox()
+		loop()
+	
+	except KeyboardInterrupt or NameError:
+	  turnoffKI()
+		
+		
+		
+		
+		
+		
+
